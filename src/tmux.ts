@@ -270,8 +270,11 @@ export async function executeCommand(paneId: string, command: string, rawMode?: 
       'BSpace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown',
       'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12'];
 
-    if (specialKeys.includes(fullCommand)) {
-      // Send special key as-is
+    // Also match tmux modifier key sequences like C-c, C-z, M-a, S-Up, etc.
+    const isModifierKey = /^[CMS]-/.test(fullCommand);
+
+    if (specialKeys.includes(fullCommand) || isModifierKey) {
+      // Send special key or modifier sequence as-is (unquoted) so tmux interprets it
       await executeTmux(`send-keys -t '${paneId}' ${fullCommand}`);
     } else {
       // For regular text, send each character individually to ensure proper processing
@@ -336,6 +339,37 @@ export async function checkCommandStatus(commandId: string): Promise<CommandExec
 // Get command by ID
 export function getCommand(commandId: string): CommandExecution | null {
   return activeCommands.get(commandId) || null;
+}
+
+/**
+ * Execute a command and wait until it completes or the timeout elapses.
+ * Returns the final CommandExecution state. If the timeout is reached
+ * before completion, the returned command keeps status 'pending'.
+ */
+export async function executeCommandAndWait(
+  paneId: string,
+  command: string,
+  timeoutMs: number = 30000,
+  pollIntervalMs: number = 500
+): Promise<CommandExecution> {
+  const commandId = await executeCommand(paneId, command, false, false);
+
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    const status = await checkCommandStatus(commandId);
+
+    if (status && status.status !== 'pending') {
+      return status;
+    }
+
+    if (Date.now() >= deadline) {
+      return status ?? (activeCommands.get(commandId) as CommandExecution);
+    }
+
+    const remaining = deadline - Date.now();
+    await new Promise(resolve => setTimeout(resolve, Math.min(pollIntervalMs, remaining)));
+  }
 }
 
 // Get all active command IDs
