@@ -236,8 +236,20 @@ export async function splitPane(
 // Map to track ongoing command executions
 const activeCommands = new Map<string, CommandExecution>();
 
-const startMarkerText = 'TMUX_MCP_START';
-const endMarkerPrefix = "TMUX_MCP_DONE_";
+const startMarkerBase = 'TMUX_MCP_START_';
+const endMarkerBase = 'TMUX_MCP_DONE_';
+
+// Per-command markers embed the command UUID so that lastIndexOf() during
+// status polling cannot collide with markers from a previous run still
+// visible in the pane scrollback. Layout:
+//   start: TMUX_MCP_START_<uuid>
+//   end:   TMUX_MCP_DONE_<uuid>_<exitcode>
+function getStartMarker(commandId: string): string {
+  return `${startMarkerBase}${commandId}`;
+}
+function getEndMarkerPrefix(commandId: string): string {
+  return `${endMarkerBase}${commandId}_`;
+}
 
 // Execute a command in a tmux pane and track its execution
 export async function executeCommand(paneId: string, command: string, rawMode?: boolean, noEnter?: boolean): Promise<string> {
@@ -248,8 +260,9 @@ export async function executeCommand(paneId: string, command: string, rawMode?: 
   if (rawMode || noEnter) {
     fullCommand = command;
   } else {
-    const endMarkerText = getEndMarkerText();
-    fullCommand = `echo "${startMarkerText}"; ${command}; echo "${endMarkerText}"`;
+    const startMarker = getStartMarker(commandId);
+    const endMarkerText = getEndMarkerText(commandId);
+    fullCommand = `echo "${startMarker}"; ${command}; echo "${endMarkerText}"`;
   }
 
   // Store command in tracking map
@@ -303,9 +316,13 @@ export async function checkCommandStatus(commandId: string): Promise<CommandExec
     return command;
   }
 
-  // Find the last occurrence of the markers
-  const startIndex = content.lastIndexOf(startMarkerText);
-  const endIndex = content.lastIndexOf(endMarkerPrefix);
+  // Find the last occurrence of this command's UUID-scoped markers. The UUID
+  // suffix guarantees we never match markers from a previous run in the
+  // scrollback.
+  const startMarker = getStartMarker(commandId);
+  const endPrefix = getEndMarkerPrefix(commandId);
+  const startIndex = content.lastIndexOf(startMarker);
+  const endIndex = content.lastIndexOf(endPrefix);
 
   if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
     command.result = "Command output could not be captured properly";
@@ -314,7 +331,7 @@ export async function checkCommandStatus(commandId: string): Promise<CommandExec
 
   // Extract exit code from the end marker line
   const endLine = content.substring(endIndex).split('\n')[0];
-  const endMarkerRegex = new RegExp(`${endMarkerPrefix}(\\d+)`);
+  const endMarkerRegex = new RegExp(`${endPrefix}(\\d+)`);
   const exitCodeMatch = endLine.match(endMarkerRegex);
 
   if (exitCodeMatch) {
@@ -323,11 +340,14 @@ export async function checkCommandStatus(commandId: string): Promise<CommandExec
     command.status = exitCode === 0 ? 'completed' : 'error';
     command.exitCode = exitCode;
 
-    // Extract output between the start and end markers
-    const outputStart = startIndex + startMarkerText.length;
-    const outputContent = content.substring(outputStart, endIndex).trim();
-
-    command.result = outputContent.substring(outputContent.indexOf('\n') + 1).trim();
+    // Extract output between the start and end markers.
+    // The substring starts right after the start marker on its echo line and
+    // ends at the "T" of the end marker, so it looks like:
+    //   "\n<actual command output>\n"
+    // A single .trim() strips both surrounding newlines without dropping the
+    // first line of real output.
+    const outputStart = startIndex + startMarker.length;
+    command.result = content.substring(outputStart, endIndex).trim();
 
     // Update in map
     activeCommands.set(commandId, command);
@@ -390,9 +410,10 @@ export function cleanupOldCommands(maxAgeMinutes: number = 60): void {
   }
 }
 
-function getEndMarkerText(): string {
+function getEndMarkerText(commandId: string): string {
+  const prefix = getEndMarkerPrefix(commandId);
   return shellConfig.type === 'fish'
-    ? `${endMarkerPrefix}$status`
-    : `${endMarkerPrefix}$?`;
+    ? `${prefix}$status`
+    : `${prefix}$?`;
 }
 
